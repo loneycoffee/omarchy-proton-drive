@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""pdrive - Proton Drive through rclone, for the bar panel.
+
+  pdrive [OPTS] status        JSON: installed, signed in, mounted, the unit's state
+  pdrive [OPTS] about         JSON: used / free / total bytes (asks Proton)
+  pdrive [OPTS] mount         write the user unit and start it
+  pdrive [OPTS] unmount       stop the unit
+  pdrive [OPTS] autostart on|off
+  pdrive [OPTS] log           the last lines rclone logged
+  pdrive [OPTS] setup         interactive: sign in to Proton Drive
+
+  OPTS: --remote NAME (default proton)   --mount DIR (default ~/ProtonDrive)
+
+The drive is an `rclone mount` of the protondrive backend, run by the
+systemd user unit proton-drive.service with a full VFS cache: files open at
+local speed once read, and writes go up in the background. The password is
+stored obscured in rclone's config (~/.config/rclone/rclone.conf), which is
+reversible: keep that file to yourself, or encrypt it with `rclone config`.
+"""
+
+import getpass
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+UNIT = "proton-drive.service"
+UNIT_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "systemd/user", UNIT)
+
+
+def emit(value):
+    json.dump(value, sys.stdout)
+    sys.stdout.write("\n")
+
+
+def run(args, timeout=30, **kw):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, **kw)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(args, 1, "", str(exc))
+
+
+def systemctl(*args):
+    return run(["systemctl", "--user", *args])
+
+
+def remotes():
+    if not shutil.which("rclone"):
+        return []
+    return [r.rstrip(":") for r in run(["rclone", "listremotes"]).stdout.split()]
+
+
+def unit_text(remote, mount):
+    rclone = shutil.which("rclone") or "/usr/bin/rclone"
+    fusermount = shutil.which("fusermount3") or "/usr/bin/fusermount3"
+    return f"""[Unit]
+Description=Proton Drive ({remote}: on {mount})
+Documentation=https://rclone.org/protondrive/
+
+[Service]
+Type=notify
+ExecStartPre=/usr/bin/mkdir -p "{mount}"
+ExecStart={rclone} mount {remote}: "{mount}" \\
+  --vfs-cache-mode full \\
+  --vfs-cache-max-age 72h \\
+  --vfs-cache-max-size 10G \\
+  --dir-cache-time 1m \\
+  --volname "Proton Drive" \\
+  --log-level NOTICE
+ExecStop={fusermount} -uz "{mount}"
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def write_unit(remote, mount):
+    text = unit_text(remote, mount)
+    try:
+        with open(UNIT_PATH) as fh:
+            if fh.read() == text:
+                return
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(UNIT_PATH), exist_ok=True)
+    with open(UNIT_PATH, "w") as fh:
+        fh.write(text)
+    systemctl("daemon-reload")
+
+
+def last_log(lines=20):
+    out = run(["journalctl", "--user", "-u", UNIT, "-n", str(lines), "--no-pager", "-o", "cat"]).stdout
+    return [l for l in out.splitlines() if l.strip()]
+
+
+def status(remote, mount):
+    installed = bool(shutil.which("rclone"))
+    active = systemctl("is-active", UNIT).stdout.strip() or "inactive"
+    enabled = systemctl("is-enabled", UNIT).stdout.strip() == "enabled"
+    out = {
+        "installed": installed,
+        "fuse": bool(shutil.which("fusermount3")),
+        "configured": remote in remotes(),
+        "remote": remote,
+        "mountpoint": mount,
+        "mounted": os.path.ismount(mount),
+        "state": active,  # active, activating, deactivating, inactive, failed
+        "autostart": enabled,
+        "error": "",
+    }
+    if active == "failed" or (active == "activating" and not out["mounted"]):
+        errors = [l for l in last_log(40) if "ERROR" in l or "CRITICAL" in l or "Fatal" in l]
+        out["error"] = errors[-1].split(": ", 1)[-1][:240] if errors else ""
+    return out
+
+
+def about(remote):
+    if remote not in remotes():
+        return {"ok": False, "error": "not signed in"}
+    proc = run(["rclone", "about", remote + ":", "--json"], timeout=45)
+    if proc.returncode != 0:
+        return {"ok": False, "error": (proc.stderr.strip().splitlines() or ["rclone about failed"])[-1][:240]}
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        return {"ok": False, "error": "unreadable answer from rclone"}
+    return {"ok": True, "used": data.get("used", 0), "free": data.get("free", 0), "total": data.get("total", 0)}
+
+
+def result(proc):
+    message = (proc.stderr or proc.stdout).strip().splitlines()
+    emit({"ok": proc.returncode == 0, "message": message[-1] if message else ""})
+
+
+def setup(remote):
+    if not shutil.which("rclone"):
+        print("rclone is not installed. Install it with: omarchy pkg add rclone fuse3")
+        return 1
+    print("Sign in to Proton Drive (stored as the rclone remote '%s')." % remote)
+    print("Your password is kept obscured in ~/.config/rclone/rclone.conf.\n")
+    try:
+        user = input("Proton username or email: ").strip()
+        password = getpass.getpass("Password: ")
+        mailbox = getpass.getpass("Mailbox password (only for two-password mode, else Enter): ")
+        code = input("2FA code (Enter if you have none): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 130
+    if not user or not password:
+        print("Nothing changed.")
+        return 1
+
+    def obscure(secret):
+        # Through stdin, so the plain password never shows up in a process list.
+        proc = subprocess.run(["rclone", "obscure", "-"], input=secret, capture_output=True, text=True)
+        return proc.stdout.strip()
+
+    args = ["rclone", "config", "create", remote, "protondrive",
+            "username=" + user, "password=" + obscure(password)]
+    if mailbox:
+        args.append("mailbox_password=" + obscure(mailbox))
+    if code:
+        args.append("2fa=" + code)
+    if remote in remotes():
+        subprocess.run(["rclone", "config", "delete", remote])
+    proc = subprocess.run(args + ["--no-obscure", "--non-interactive"], capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(proc.stderr.strip() or proc.stdout.strip())
+        return 1
+    print("\nChecking the account…")
+    check = about(remote)
+    if not check["ok"]:
+        print("Proton Drive said: " + check["error"])
+        print("Run this again to retry (a 2FA code is only good for 30 seconds).")
+        return 1
+    print("Signed in. %.1f GB used of %.1f GB." % (check["used"] / 1e9, check["total"] / 1e9))
+    return 0
+
+
+def main(argv):
+    remote, mount, rest = "proton", os.path.expanduser("~/ProtonDrive"), []
+    it = iter(argv[1:])
+    for arg in it:
+        if arg == "--remote":
+            remote = next(it, remote) or remote
+        elif arg == "--mount":
+            mount = os.path.expanduser(next(it, mount) or mount)
+        else:
+            rest.append(arg)
+    cmd = rest[0] if rest else "status"
+    if cmd == "status":
+        emit(status(remote, mount))
+    elif cmd == "about":
+        emit(about(remote))
+    elif cmd == "mount":
+        write_unit(remote, mount)
+        result(systemctl("start", "--no-block", UNIT))
+    elif cmd == "unmount":
+        result(systemctl("stop", "--no-block", UNIT))
+    elif cmd == "autostart" and len(rest) == 2 and rest[1] in ("on", "off"):
+        if rest[1] == "on":
+            write_unit(remote, mount)
+        result(systemctl("enable" if rest[1] == "on" else "disable", UNIT))
+    elif cmd == "log":
+        print("\n".join(last_log(40)))
+    elif cmd == "setup":
+        return setup(remote)
+    else:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
