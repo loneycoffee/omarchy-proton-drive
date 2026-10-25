@@ -4,10 +4,10 @@ import Quickshell.Io
 
 // The drive's state, mounted once for the shell.
 //
-// Omarchy builds a bar per monitor; whether the drive is mounted, the space
-// used and whatever action is running live here so every bar agrees.
-// bin/pdrive does the work: `status` is local and cheap (systemctl and the
-// mount table), `about` asks Proton and runs only when the panel opens.
+// Omarchy builds a bar per monitor; the sign-in, the folder being browsed
+// and the transfer queue live here so every bar agrees and a transfer keeps
+// going when the panel closes. bin/pdrive does the talking to Proton's
+// `proton-drive` CLI. Transfers run one at a time, in the order asked for.
 Item {
   id: root
   width: 0
@@ -20,163 +20,273 @@ Item {
   property string omarchyPath: ""
 
   readonly property string ctl: Qt.resolvedUrl("bin/pdrive").toString().replace(/^file:\/\//, "")
-  readonly property string omarchyBin: (root.omarchyPath || Quickshell.env("OMARCHY_PATH") || "/usr/share/omarchy") + "/bin"
+  readonly property string home: Quickshell.env("HOME")
 
   // Set by the bar widget from its settings.
-  property string remote: "proton"
-  property string mountpoint: "~/ProtonDrive"
-  readonly property var opts: ["--remote", root.remote, "--mount", root.mountpoint]
+  property string downloadDir: "~/Downloads"
 
-  property var status: ({ installed: true, configured: true, mounted: false, state: "inactive" })
-  property var about: ({})
-  property bool aboutLoading: false
-  property bool busy: false
+  property var status: ({ installed: true, signedIn: true, error: "" })
+  property bool statusLoaded: false
+  readonly property bool installed: root.status.installed !== false
+  readonly property bool signedIn: root.status.signedIn === true
+  property bool signingIn: false
+
+  // The folder on screen.
+  property string path: "/my-files"
+  property var items: []
+  property bool listing: false
+  property string listError: ""
+
+  property var usage: ({})
+  property bool sizing: false
+
+  // Transfers: what is running and what waits.
+  property var queue: []
+  property var current: null
+  readonly property bool transferring: root.current !== null
   property string lastError: ""
-
-  readonly property bool mounted: root.status.mounted === true
-  readonly property bool starting: root.status.state === "activating" || (root.busy && !root.mounted)
-  readonly property bool failed: root.status.state === "failed"
-
-  property bool _wasMounted: false
-  property bool _announced: false
+  property string flash: ""
 
   function refresh() {
     if (!statusProc.running) statusProc.running = true
   }
 
-  function refreshAbout() {
-    if (aboutProc.running) return
-    root.aboutLoading = true
-    aboutProc.running = true
+  function open(path) {
+    root.path = path
+    root.listError = ""
+    listProc.command = [root.ctl, "list", path]
+    root.listing = true
+    // Restarting a running Process does not rerun it; stop it first.
+    listProc.running = false
+    listProc.running = true
   }
 
-  function act(args) {
-    if (actionProc.running) return
-    root.busy = true
+  function up() {
+    if (root.path === "/my-files") return
+    root.open(root.path.slice(0, root.path.lastIndexOf("/")) || "/my-files")
+  }
+
+  function measure() {
+    if (sizeProc.running) return
+    root.sizing = true
+    sizeProc.running = true
+  }
+
+  function signIn() {
+    if (loginProc.running) return
+    root.signingIn = true
     root.lastError = ""
-    actionProc.command = [root.ctl].concat(root.opts).concat(args)
+    loginProc.running = true
+  }
+
+  function cancelSignIn() {
+    loginProc.running = false
+    root.signingIn = false
+  }
+
+  function signOut() {
+    actionProc.command = [root.ctl, "logout"]
     actionProc.running = true
   }
 
-  function mount() { root.act(["mount"]) }
-  function unmount() { root.act(["unmount"]) }
-  function toggle() { root.mounted || root.starting ? root.unmount() : root.mount() }
-  function setAutostart(on) { root.act(["autostart", on ? "on" : "off"]) }
-
-  function openFolder(sub) {
-    Quickshell.execDetached(["xdg-open", root.status.mountpoint + (sub ? "/" + sub : "")])
+  function enqueue(job) {
+    root.queue = root.queue.concat([job])
+    root.next()
   }
 
-  // Signing in asks for a password and maybe a 2FA code, so it goes to a
-  // terminal rather than through the panel.
-  function signIn() {
-    var cmd = [root.ctl].concat(root.opts).concat(["setup"]).map(function(a) { return "'" + String(a).replace(/'/g, "'\\''") + "'" }).join(" ")
-    Quickshell.execDetached([root.omarchyBin + "/omarchy-launch-floating-terminal-with-presentation", cmd])
-    signinWatch.restart()
+  function next() {
+    if (root.current !== null || root.queue.length === 0) return
+    var job = root.queue[0]
+    root.queue = root.queue.slice(1)
+    root.current = job
+    root.lastError = ""
+    transferProc.command = job.kind === "upload"
+      ? [root.ctl, "upload", job.target].concat(job.files)
+      : [root.ctl, "download", job.source, job.dest]
+    transferProc.running = true
   }
 
-  function showLog() {
-    var cmd = "journalctl --user -u proton-drive.service -n 200 -f"
-    Quickshell.execDetached([root.omarchyBin + "/omarchy-launch-floating-terminal-with-presentation", cmd])
+  function upload(files, target) {
+    if (!files || files.length === 0) return
+    var label = files.length === 1 ? files[0].slice(files[0].lastIndexOf("/") + 1) : files.length + " items"
+    root.enqueue({ kind: "upload", files: files, target: target || root.path, label: label })
   }
 
-  function notify(summary, body) {
-    Quickshell.execDetached(["notify-send", "-a", "Proton Drive", "-i", "folder-remote", summary, body || ""])
+  // Asks the desktop file chooser, then uploads what was picked.
+  function pickAndUpload(target) {
+    if (pickProc.running) return
+    pickProc.target = target || root.path
+    pickProc.running = true
+  }
+
+  function download(item) {
+    root.enqueue({ kind: "download", source: item.path, dest: root.downloadDir, label: item.name })
+  }
+
+  function copyLink(item) {
+    shareProc.label = item.name
+    shareProc.command = [root.ctl, "share", item.path]
+    shareProc.running = true
+  }
+
+  function notify(summary, body, icon) {
+    Quickshell.execDetached(["notify-send", "-a", "Proton Drive", "-i", icon || "folder-cloud", summary, body || ""])
+  }
+
+  function showFlash(text) {
+    root.flash = text
+    flashTimer.restart()
+  }
+
+  function size(bytes) {
+    var units = ["B", "KB", "MB", "GB", "TB"]
+    var n = Number(bytes) || 0
+    var i = 0
+    while (n >= 1000 && i < units.length - 1) {
+      n /= 1000
+      i++
+    }
+    return (i === 0 ? n : n.toFixed(n < 10 ? 1 : 0)) + " " + units[i]
+  }
+
+  function parse(text, fallback) {
+    try {
+      return JSON.parse(String(text || ""))
+    } catch (e) {
+      return fallback
+    }
   }
 
   Process {
     id: statusProc
-    command: [root.ctl].concat(root.opts).concat(["status"])
+    command: [root.ctl, "status"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        try {
-          var next = JSON.parse(String(text || "{}"))
-          var was = root._wasMounted
-          root.status = next
-          if (next.mounted !== was) {
-            root._wasMounted = next.mounted === true
-            if (root._announced && !next.mounted && next.state === "failed")
-              root.notify("Proton Drive stopped", next.error || "rclone exited; see the log")
-          }
-          root._announced = true
-        } catch (e) {
-          console.warn("proton-drive: unreadable status")
-        }
+        var next = root.parse(text, null)
+        if (!next) return
+        var was = root.signedIn
+        root.status = next
+        root.statusLoaded = true
+        if (next.signedIn && (!was || root.items.length === 0)) root.open(root.path)
       }
     }
   }
 
   Process {
-    id: aboutProc
-    command: [root.ctl].concat(root.opts).concat(["about"])
+    id: listProc
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        try {
-          root.about = JSON.parse(String(text || "{}"))
-        } catch (e) {
-          root.about = {}
-        }
-        root.aboutLoading = false
+        var r = root.parse(text, { ok: false, error: "unreadable listing", items: [] })
+        // A slow listing for a folder already left behind is not news.
+        if (r.path && r.path !== root.path) return
+        root.items = r.items || []
+        root.listError = r.ok ? "" : (r.error || "")
+        root.listing = false
       }
+    }
+  }
+
+  Process {
+    id: sizeProc
+    command: [root.ctl, "size", "/my-files"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.usage = root.parse(text, {})
+        root.sizing = false
+      }
+    }
+  }
+
+  Process {
+    id: loginProc
+    command: [root.ctl, "login"]
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var msg = String(text || "").trim()
+        if (msg !== "" && root.signingIn) root.lastError = msg.split("\n")[0]
+      }
+    }
+    onRunningChanged: {
+      if (running) return
+      root.signingIn = false
+      root.refresh()
     }
   }
 
   Process {
     id: actionProc
+    onRunningChanged: if (!running) {
+      root.items = []
+      root.usage = {}
+      root.path = "/my-files"
+      root.refresh()
+    }
+  }
+
+  Process {
+    id: pickProc
+    property string target: ""
+    command: [root.ctl, "pick"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.upload(root.parse(text, []), pickProc.target)
+    }
+  }
+
+  Process {
+    id: shareProc
+    property string label: ""
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        try {
-          var r = JSON.parse(String(text || "{}"))
-          if (!r.ok) root.lastError = r.message || "systemctl failed"
-        } catch (e) {}
-        root.busy = false
-        root.refresh()
-        settle.restart()
+        var r = root.parse(text, { ok: false, error: "no answer" })
+        if (r.ok) {
+          Quickshell.execDetached(["wl-copy", r.url])
+          root.showFlash("Link to " + shareProc.label + " copied")
+          root.open(root.path)
+        } else {
+          root.lastError = r.error
+        }
       }
     }
   }
 
-  // Starting a mount takes a few seconds (rclone signs in first); look again
-  // quickly until it settles.
-  Timer {
-    id: settle
-    property int tries: 0
-    interval: 1000
-    repeat: true
-    onRunningChanged: if (running) tries = 0
-    onTriggered: {
-      root.refresh()
-      tries++
-      if (tries > 20 || (root.status.state !== "activating" && root.status.state !== "deactivating")) stop()
-    }
-  }
-
-  Timer {
-    interval: 15000
-    repeat: true
-    running: true
-    onTriggered: root.refresh()
-  }
-
-  Timer {
-    id: signinWatch
-    property int tries: 0
-    interval: 5000
-    repeat: true
-    onRunningChanged: if (running) tries = 0
-    onTriggered: {
-      root.refresh()
-      tries++
-      if (root.status.configured || tries > 36) {
-        stop()
-        if (root.status.configured) root.refreshAbout()
+  Process {
+    id: transferProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var job = root.current
+        var r = root.parse(text, { ok: false, error: "no answer from proton-drive" })
+        if (job) {
+          var verb = job.kind === "upload" ? "Uploaded" : "Downloaded"
+          if (r.ok) {
+            var body = r.items + " item" + (r.items === 1 ? "" : "s") + ", " + root.size(r.bytes)
+              + (r.skipped ? " (" + r.skipped + " already there)" : "")
+            root.notify(verb + " " + job.label, job.kind === "download" ? body + "\nto " + job.dest : body,
+              job.kind === "upload" ? "folder-cloud" : "folder-download")
+          } else {
+            var why = r.error || (r.failures || []).join("\n") || "unknown error"
+            root.lastError = (job.kind === "upload" ? "Upload" : "Download") + " of " + job.label + " failed: " + why
+            root.notify((job.kind === "upload" ? "Upload" : "Download") + " failed", job.label + "\n" + why, "dialog-error")
+          }
+          if (job.kind === "upload" && (job.target === root.path)) root.open(root.path)
+        }
+        root.current = null
+        root.next()
       }
     }
   }
 
-  onOptsChanged: root.refresh()
+  Timer {
+    id: flashTimer
+    interval: 2500
+    onTriggered: root.flash = ""
+  }
+
   Component.onCompleted: root.refresh()
 }

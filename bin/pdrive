@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
-"""pdrive - Proton Drive through rclone, for the bar panel.
+"""pdrive - Proton Drive through Proton's official CLI, for the bar panel.
 
-  pdrive [OPTS] status        JSON: installed, signed in, mounted, the unit's state
-  pdrive [OPTS] about         JSON: used / free / total bytes (asks Proton)
-  pdrive [OPTS] mount         write the user unit and start it
-  pdrive [OPTS] unmount       stop the unit
-  pdrive [OPTS] autostart on|off
-  pdrive [OPTS] log           the last lines rclone logged
-  pdrive [OPTS] setup         interactive: sign in to Proton Drive
+  pdrive status                  JSON: is the CLI installed, is anyone signed in
+  pdrive login                   sign in through the browser (waits until done)
+  pdrive logout                  sign out
+  pdrive list PATH               JSON: a folder's items, folders first
+  pdrive size [PATH]             JSON: bytes and items under PATH (default /my-files)
+  pdrive upload PARENT FILE...   upload files or folders into PARENT, as JSON
+  pdrive download PATH DIR       download PATH into the local DIR, as JSON
+  pdrive share PATH              JSON: the public link to PATH, made if missing
+  pdrive pick                    JSON: files chosen in the desktop file chooser
 
-  OPTS: --remote NAME (default proton)   --mount DIR (default ~/ProtonDrive)
+PATHs are Drive paths as the CLI takes them: /my-files is your root, so a file
+is /my-files/Documents/cv.pdf. Uploads that meet a file of the same name keep
+both (rename); folders are merged. Downloads never overwrite a local file.
 
-The drive is an `rclone mount` of the protondrive backend, run by the
-systemd user unit proton-drive.service with a full VFS cache: files open at
-local speed once read, and writes go up in the background. The password is
-stored obscured in rclone's config (~/.config/rclone/rclone.conf), which is
-reversible: keep that file to yourself, or encrypt it with `rclone config`.
+The CLI (`proton-drive`) keeps its session in your keyring; nothing here
+stores a password.
 """
 
-import getpass
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 
-UNIT = "proton-drive.service"
-UNIT_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "systemd/user", UNIT)
+CLI = "proton-drive"
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
 def emit(value):
@@ -34,180 +35,160 @@ def emit(value):
     sys.stdout.write("\n")
 
 
-def run(args, timeout=30, **kw):
+def cli(*args, timeout=120):
+    if not shutil.which(CLI):
+        return 127, "", "proton-drive is not installed"
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, **kw)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return subprocess.CompletedProcess(args, 1, "", str(exc))
+        proc = subprocess.run([CLI, *args], capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return 124, "", "proton-drive timed out"
+    return proc.returncode, proc.stdout, ANSI_RE.sub("", proc.stderr)
 
 
-def systemctl(*args):
-    return run(["systemctl", "--user", *args])
+def last_line(text, fallback):
+    lines = [l.strip() for l in ANSI_RE.sub("", text).splitlines() if l.strip()]
+    # Skip stack-trace noise; the CLI prints the message itself first.
+    lines = [l for l in lines if not l.startswith(("at ", "====", "Error details", "{", "}"))]
+    return lines[0][:300] if lines else fallback
 
 
-def remotes():
-    if not shutil.which("rclone"):
-        return []
-    return [r.rstrip(":") for r in run(["rclone", "listremotes"]).stdout.split()]
-
-
-def unit_text(remote, mount):
-    rclone = shutil.which("rclone") or "/usr/bin/rclone"
-    fusermount = shutil.which("fusermount3") or "/usr/bin/fusermount3"
-    return f"""[Unit]
-Description=Proton Drive ({remote}: on {mount})
-Documentation=https://rclone.org/protondrive/
-
-[Service]
-Type=notify
-ExecStartPre=/usr/bin/mkdir -p "{mount}"
-ExecStart={rclone} mount {remote}: "{mount}" \\
-  --vfs-cache-mode full \\
-  --vfs-cache-max-age 72h \\
-  --vfs-cache-max-size 10G \\
-  --dir-cache-time 1m \\
-  --volname "Proton Drive" \\
-  --log-level NOTICE
-ExecStop={fusermount} -uz "{mount}"
-Restart=on-failure
-RestartSec=30
-
-[Install]
-WantedBy=default.target
-"""
-
-
-def write_unit(remote, mount):
-    text = unit_text(remote, mount)
+def parse_json(text):
     try:
-        with open(UNIT_PATH) as fh:
-            if fh.read() == text:
-                return
-    except OSError:
-        pass
-    os.makedirs(os.path.dirname(UNIT_PATH), exist_ok=True)
-    with open(UNIT_PATH, "w") as fh:
-        fh.write(text)
-    systemctl("daemon-reload")
-
-
-def last_log(lines=20):
-    out = run(["journalctl", "--user", "-u", UNIT, "-n", str(lines), "--no-pager", "-o", "cat"]).stdout
-    return [l for l in out.splitlines() if l.strip()]
-
-
-def status(remote, mount):
-    installed = bool(shutil.which("rclone"))
-    active = systemctl("is-active", UNIT).stdout.strip() or "inactive"
-    enabled = systemctl("is-enabled", UNIT).stdout.strip() == "enabled"
-    out = {
-        "installed": installed,
-        "fuse": bool(shutil.which("fusermount3")),
-        "configured": remote in remotes(),
-        "remote": remote,
-        "mountpoint": mount,
-        "mounted": os.path.ismount(mount),
-        "state": active,  # active, activating, deactivating, inactive, failed
-        "autostart": enabled,
-        "error": "",
-    }
-    if active == "failed" or (active == "activating" and not out["mounted"]):
-        errors = [l for l in last_log(40) if "ERROR" in l or "CRITICAL" in l or "Fatal" in l]
-        out["error"] = errors[-1].split(": ", 1)[-1][:240] if errors else ""
-    return out
-
-
-def about(remote):
-    if remote not in remotes():
-        return {"ok": False, "error": "not signed in"}
-    proc = run(["rclone", "about", remote + ":", "--json"], timeout=45)
-    if proc.returncode != 0:
-        return {"ok": False, "error": (proc.stderr.strip().splitlines() or ["rclone about failed"])[-1][:240]}
-    try:
-        data = json.loads(proc.stdout)
+        return json.loads(text)
     except ValueError:
-        return {"ok": False, "error": "unreadable answer from rclone"}
-    return {"ok": True, "used": data.get("used", 0), "free": data.get("free", 0), "total": data.get("total", 0)}
+        # Some commands log a line or two before the JSON.
+        start = min([i for i in (text.find("["), text.find("{")) if i != -1] or [-1])
+        if start == -1:
+            return None
+        try:
+            return json.loads(text[start:])
+        except ValueError:
+            return None
 
 
-def result(proc):
-    message = (proc.stderr or proc.stdout).strip().splitlines()
-    emit({"ok": proc.returncode == 0, "message": message[-1] if message else ""})
+def status():
+    installed = bool(shutil.which(CLI))
+    if not installed:
+        return {"installed": False, "signedIn": False, "error": ""}
+    # Listing "/" only prints the fixed top-level sections, so it is a cheap
+    # way to ask whether a session exists.
+    rc, out, err = cli("filesystem", "list", "/", "--json", timeout=30)
+    signed_in = rc == 0
+    error = "" if signed_in else last_line(err or out, "")
+    if "login first" in error:
+        error = ""
+    return {"installed": True, "signedIn": signed_in, "error": error}
 
 
-def setup(remote):
-    if not shutil.which("rclone"):
-        print("rclone is not installed. Install it with: omarchy pkg add rclone fuse3")
-        return 1
-    print("Sign in to Proton Drive (stored as the rclone remote '%s')." % remote)
-    print("Your password is kept obscured in ~/.config/rclone/rclone.conf.\n")
-    try:
-        user = input("Proton username or email: ").strip()
-        password = getpass.getpass("Password: ")
-        mailbox = getpass.getpass("Mailbox password (only for two-password mode, else Enter): ")
-        code = input("2FA code (Enter if you have none): ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return 130
-    if not user or not password:
-        print("Nothing changed.")
-        return 1
+def name_of(node):
+    name = node.get("name")
+    if isinstance(name, dict):
+        return name.get("value") if name.get("ok") else ""
+    return name or ""
 
-    def obscure(secret):
-        # Through stdin, so the plain password never shows up in a process list.
-        proc = subprocess.run(["rclone", "obscure", "-"], input=secret, capture_output=True, text=True)
-        return proc.stdout.strip()
 
-    args = ["rclone", "config", "create", remote, "protondrive",
-            "username=" + user, "password=" + obscure(password)]
-    if mailbox:
-        args.append("mailbox_password=" + obscure(mailbox))
-    if code:
-        args.append("2fa=" + code)
-    if remote in remotes():
-        subprocess.run(["rclone", "config", "delete", remote])
-    proc = subprocess.run(args + ["--no-obscure", "--non-interactive"], capture_output=True, text=True)
-    if proc.returncode != 0:
-        print(proc.stderr.strip() or proc.stdout.strip())
-        return 1
-    print("\nChecking the account…")
-    check = about(remote)
-    if not check["ok"]:
-        print("Proton Drive said: " + check["error"])
-        print("Run this again to retry (a 2FA code is only good for 30 seconds).")
-        return 1
-    print("Signed in. %.1f GB used of %.1f GB." % (check["used"] / 1e9, check["total"] / 1e9))
-    return 0
+def listing(path):
+    rc, out, err = cli("filesystem", "list", path, "--json", timeout=90)
+    if rc != 0:
+        return {"ok": False, "error": last_line(err or out, "could not list " + path), "items": []}
+    items = []
+    for node in parse_json(out) or []:
+        name = name_of(node)
+        if not name:
+            continue
+        rev = node.get("activeRevision") or {}
+        items.append({
+            "name": name,
+            "path": path.rstrip("/") + "/" + name,
+            "folder": node.get("type") == "folder",
+            "size": rev.get("claimedSize") or node.get("totalStorageSize") or 0,
+            "modified": rev.get("claimedModificationTime") or node.get("modificationTime") or "",
+            "shared": bool(node.get("isShared")),
+            "mediaType": node.get("mediaType") or "",
+        })
+    items.sort(key=lambda i: (not i["folder"], i["name"].lower()))
+    return {"ok": True, "path": path, "items": items}
+
+
+def size(path):
+    rc, out, err = cli("filesystem", "size", path, "--json", timeout=300)
+    data = parse_json(out) if rc == 0 else None
+    if not isinstance(data, dict):
+        return {"ok": False, "error": last_line(err or out, "could not size " + path)}
+    return {"ok": True, "size": data.get("size", 0), "items": data.get("numberOfDescendants", 0)}
+
+
+def transfer(kind, args):
+    rc, out, err = cli("filesystem", kind, *args, "--json",
+                       "--file-conflict-strategy", "rename", "--folder-conflict-strategy", "merge",
+                       timeout=6 * 3600)
+    summary = {}
+    for line in out.splitlines():
+        data = parse_json(line) if line.strip().startswith("{") else None
+        if isinstance(data, dict) and "transferredItems" in data:
+            summary = data
+    out_json = {
+        "ok": rc == 0,
+        "items": summary.get("transferredItems", 0),
+        "bytes": summary.get("transferredBytes", 0),
+        "skipped": summary.get("skippedItems", 0),
+        "failed": summary.get("failedItems", 0),
+        "failures": [f.get("name", "") + ": " + f.get("error", "") for f in summary.get("failures", [])][:5],
+    }
+    if rc != 0 and not out_json["failures"]:
+        out_json["error"] = last_line(err or out, kind + " failed")
+    return out_json
+
+
+def share(path):
+    rc, out, err = cli("sharing", "set-url", path, "--json", timeout=90)
+    data = parse_json(out) if rc == 0 else None
+    url = ((data or {}).get("urlAccess") or {}).get("url", "") if isinstance(data, dict) else ""
+    if not url:
+        return {"ok": False, "error": last_line(err or out, "could not make a link")}
+    return {"ok": True, "url": url}
+
+
+def pick():
+    picker = shutil.which("omarchy-file-select")
+    if picker:
+        cmd = [picker, "--title", "Upload to Proton Drive", "--multiple"]
+    elif shutil.which("zenity"):
+        cmd = ["zenity", "--file-selection", "--multiple", "--separator=\n", "--title=Upload to Proton Drive"]
+    else:
+        return []
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    return [p for p in proc.stdout.splitlines() if p.strip() and os.path.exists(p)]
 
 
 def main(argv):
-    remote, mount, rest = "proton", os.path.expanduser("~/ProtonDrive"), []
-    it = iter(argv[1:])
-    for arg in it:
-        if arg == "--remote":
-            remote = next(it, remote) or remote
-        elif arg == "--mount":
-            mount = os.path.expanduser(next(it, mount) or mount)
-        else:
-            rest.append(arg)
-    cmd = rest[0] if rest else "status"
+    cmd = argv[1] if len(argv) > 1 else "status"
+    args = argv[2:]
     if cmd == "status":
-        emit(status(remote, mount))
-    elif cmd == "about":
-        emit(about(remote))
-    elif cmd == "mount":
-        write_unit(remote, mount)
-        result(systemctl("start", "--no-block", UNIT))
-    elif cmd == "unmount":
-        result(systemctl("stop", "--no-block", UNIT))
-    elif cmd == "autostart" and len(rest) == 2 and rest[1] in ("on", "off"):
-        if rest[1] == "on":
-            write_unit(remote, mount)
-        result(systemctl("enable" if rest[1] == "on" else "disable", UNIT))
-    elif cmd == "log":
-        print("\n".join(last_log(40)))
-    elif cmd == "setup":
-        return setup(remote)
+        emit(status())
+    elif cmd == "login":
+        if not shutil.which(CLI):
+            print("proton-drive is not installed", file=sys.stderr)
+            return 127
+        # Opens the browser itself and returns once the sign-in went through.
+        return subprocess.call([CLI, "auth", "login"], stdin=subprocess.DEVNULL)
+    elif cmd == "logout":
+        rc, out, err = cli("auth", "logout")
+        emit({"ok": rc == 0, "error": "" if rc == 0 else last_line(err or out, "logout failed")})
+    elif cmd == "list" and len(args) == 1:
+        emit(listing(args[0]))
+    elif cmd == "size" and len(args) <= 1:
+        emit(size(args[0] if args else "/my-files"))
+    elif cmd == "upload" and len(args) >= 2:
+        emit(transfer("upload", args[1:] + [args[0]]))
+    elif cmd == "download" and len(args) == 2:
+        os.makedirs(os.path.expanduser(args[1]), exist_ok=True)
+        emit(transfer("download", [args[0], os.path.expanduser(args[1])]))
+    elif cmd == "share" and len(args) == 1:
+        emit(share(args[0]))
+    elif cmd == "pick":
+        emit(pick())
     else:
         print(__doc__.strip(), file=sys.stderr)
         return 2

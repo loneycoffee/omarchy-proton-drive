@@ -1,66 +1,75 @@
 # Proton Drive
 
-A cloud on the Omarchy bar that puts your Proton Drive in a folder, using
-[rclone's Proton Drive backend](https://rclone.org/protondrive/).
+A cloud on the Omarchy bar for Proton's official
+[Drive CLI](https://github.com/protondriveapps/sdk/tree/main/cli)
+(`proton-drive`): your files a click away, without a sync client.
 
-- **The cloud** is checked while the drive is mounted, pulses while mounting,
-  and shows a warning when rclone stopped with an error. **Right click** opens
-  the folder, mounting it first if needed.
-- **The panel** has the mount switch, the space used and free, and buttons for
-  the folder, the web app and rclone's log.
-- **Mount at login**, as a switch.
+- **Browse** My files folder by folder, with sizes and dates; the path on top
+  takes you back up.
+- **Upload** files picked in the desktop file chooser into the folder on
+  screen. **Right click** the cloud to upload into `uploadFolder` without
+  opening anything.
+- **Download** a file (click it) or a whole folder (the button on hover) into
+  `~/Downloads`. Nothing local is overwritten: a name already there gets a
+  suffix.
+- **Copy a public link** to anything; one is made if it has none.
+- Transfers queue up, carry on with the panel closed, and end in a
+  notification. The cloud pulses while one runs.
+- **Size** adds up what My files holds (it walks the whole tree, so it waits for
+  a click).
 
-The mount is `rclone mount` run by the systemd user unit
-`proton-drive.service` (written to `~/.config/systemd/user/` on first mount),
-with a full VFS cache: a file opens at local speed once it has been read, and
-changes go up in the background, even across restarts.
+Uploads that meet a file of the same name keep both; folders are merged.
 
 ## Install
 
 ```bash
-omarchy pkg add rclone
+omarchy pkg aur add proton-drive-cli-git
 omarchy plugin add https://github.com/loneycoffee/omarchy-proton-drive.git --enable
 ```
 
-Then click the cloud and **Sign in…**: a terminal asks for your username,
-password, mailbox password (two-password mode only) and 2FA code, and checks
-them right away. rclone keeps the session afterwards, so the 2FA code is
-needed once.
-
-Your password is stored *obscured* in `~/.config/rclone/rclone.conf`, which is
-not encryption: keep that file to yourself, or set a config password with
-`rclone config` (the unit then needs `RCLONE_CONFIG_PASS`).
+(or put the binary from [proton.me/download/drive/cli](https://proton.me/download/drive/cli/index.html)
+on your `PATH` as `proton-drive`). Then click the cloud and **Sign in**: Proton's
+sign-in page opens in your browser, and the panel picks it up once you are
+through. The CLI keeps the session in your keyring (libsecret); no password is
+stored anywhere.
 
 Open the panel from a keybinding with
 `omarchy-shell shell toggle proton-drive`.
+
+## What it does not do
+
+Proton's CLI has no mount and no sync yet (Proton lists sync as coming), so
+there is no `~/ProtonDrive` folder that stays up to date: this is a browser
+with upload and download. The CLI is pre-release, and Proton plans a change of
+its encryption model around the turn of 2027 that older CLI versions will not
+survive; keep it updated.
 
 ## Settings
 
 On the `proton-drive` bar entry in `~/.config/omarchy/shell.json`:
 
-| Key          | Default                   | Meaning                         |
-|--------------|---------------------------|---------------------------------|
-| `mountpoint` | `~/ProtonDrive`           | Where the drive shows up        |
-| `remote`     | `proton`                  | The rclone remote's name        |
-| `webUrl`     | `https://drive.proton.me` | What the Web button opens       |
+| Key            | Default                   | Meaning                                  |
+|----------------|---------------------------|------------------------------------------|
+| `uploadFolder` | `/my-files`               | Where right click uploads (a Drive path) |
+| `downloadDir`  | `~/Downloads`             | Where downloads land                     |
+| `webUrl`       | `https://drive.proton.me` | What the Web link opens                  |
 
 ## Keys in the panel
 
-`enter` mount/unmount · `o` open folder · `w` web · `r` refresh storage · `esc` close
+`h` up a folder · `u` upload here · `r` refresh · `w` web · `esc` close
 
 ## Command line
 
 ```
-pdrive [OPTS] status        JSON: installed, signed in, mounted, the unit's state
-pdrive [OPTS] about         JSON: used / free / total bytes (asks Proton)
-pdrive [OPTS] mount         write the user unit and start it
-pdrive [OPTS] unmount       stop the unit
-pdrive [OPTS] autostart on|off
-pdrive [OPTS] log           the last lines rclone logged
-pdrive [OPTS] setup         interactive: sign in to Proton Drive
-
-OPTS: --remote NAME (default proton)   --mount DIR (default ~/ProtonDrive)
+pdrive status                  JSON: is the CLI installed, is anyone signed in
+pdrive login                   sign in through the browser (waits until done)
+pdrive logout                  sign out
+pdrive list PATH               JSON: a folder's items, folders first
+pdrive size [PATH]             JSON: bytes and items under PATH (default /my-files)
+pdrive upload PARENT FILE...   upload files or folders into PARENT, as JSON
+pdrive download PATH DIR       download PATH into the local DIR, as JSON
+pdrive share PATH              JSON: the public link to PATH, made if missing
+pdrive pick                    JSON: files chosen in the desktop file chooser
 ```
 
-rclone's Proton Drive backend is community-built against Proton's unofficial
-API; it works well for files and folders, but it is not Proton's own client.
+Drive paths are the CLI's: `/my-files` is your root.

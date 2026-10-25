@@ -2,11 +2,11 @@
   "schemaVersion": 1,
   "id": "proton-drive",
   "name": "Proton Drive",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "author": "loneycoffee",
   "license": "MIT",
   "homepage": "https://github.com/loneycoffee/omarchy-proton-drive",
-  "description": "A cloud on the bar that mounts your Proton Drive as a folder with rclone (a systemd user unit with a full VFS cache): a switch to mount it, the space used, mount at login, and quick ways into the folder, the web app and rclone's log. Right click opens the folder. Toggle the panel with: omarchy-shell shell toggle proton-drive",
+  "description": "A cloud on the bar for Proton's official Drive CLI: browse My files, upload from the file chooser, download a file or folder with a click, and copy a public link to anything. Transfers run in the background and end in a notification. Right click uploads. Toggle the panel with: omarchy-shell shell toggle proton-drive",
   "kinds": [
     "service",
     "bar-widget"
@@ -17,27 +17,27 @@
   },
   "barWidget": {
     "displayName": "Proton Drive",
-    "description": "Mount Proton Drive as a folder",
+    "description": "Browse, upload, download and share Proton Drive files",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "remote": "proton",
-      "mountpoint": "~/ProtonDrive",
+      "uploadFolder": "/my-files",
+      "downloadDir": "~/Downloads",
       "webUrl": "https://drive.proton.me"
     },
     "schema": [
       {
-        "key": "mountpoint",
+        "key": "uploadFolder",
         "type": "string",
-        "label": "Mount the drive at",
-        "defaultValue": "~/ProtonDrive"
+        "label": "Right click uploads into (a Drive path)",
+        "defaultValue": "/my-files"
       },
       {
-        "key": "remote",
+        "key": "downloadDir",
         "type": "string",
-        "label": "rclone remote name",
-        "defaultValue": "proton"
+        "label": "Download into",
+        "defaultValue": "~/Downloads"
       }
     ]
   }
