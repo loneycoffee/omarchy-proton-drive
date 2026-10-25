@@ -215,7 +215,7 @@ Panel {
           visible: !root.installed
           textFormat: Text.PlainText
           wrapMode: Text.Wrap
-          text: "Proton's Drive CLI is not installed. Install it with:\nomarchy pkg aur add proton-drive-cli-git\nor get it from proton.me/download/drive/cli"
+          text: "Proton's Drive CLI is not installed. Get it from proton.me/download/drive/cli and put it on your PATH as proton-drive (for example ~/.local/bin/proton-drive)."
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.body

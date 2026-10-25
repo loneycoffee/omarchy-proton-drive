@@ -22,13 +22,20 @@ Uploads that meet a file of the same name keep both; folders are merged.
 
 ## Install
 
+Put Proton's binary on your `PATH` as `proton-drive` (check it against the
+SHA-512 on [proton.me/download/drive/cli](https://proton.me/download/drive/cli/index.html)):
+
 ```bash
-omarchy pkg aur add proton-drive-cli-git
+curl -Lo ~/.local/bin/proton-drive https://proton.me/download/drive/cli/0.9.0/linux-x64/proton-drive
+sha512sum ~/.local/bin/proton-drive   # compare with the page
+chmod +x ~/.local/bin/proton-drive
 omarchy plugin add https://github.com/loneycoffee/omarchy-proton-drive.git --enable
 ```
 
-(or put the binary from [proton.me/download/drive/cli](https://proton.me/download/drive/cli/index.html)
-on your `PATH` as `proton-drive`). Then click the cloud and **Sign in**: Proton's
+The AUR's `proton-drive-cli-git` builds from source instead, but its build
+fetches packages from Proton's own registry (`pkg.protontech.ch`), which is not
+reachable from every network; when it is not, the build hangs. `proton-drive
+version` says when a newer CLI is out. Then click the cloud and **Sign in**: Proton's
 sign-in page opens in your browser, and the panel picks it up once you are
 through. The CLI keeps the session in your keyring (libsecret); no password is
 stored anywhere.
