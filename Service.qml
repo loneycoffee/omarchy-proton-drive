@@ -20,6 +20,9 @@ Item {
   property string omarchyPath: ""
 
   readonly property string ctl: Qt.resolvedUrl("bin/pdrive").toString().replace(/^file:\/\//, "")
+  // Bundled, as a path: icon-theme names vary between themes, and one the
+  // notification popup cannot find shows up as a checkerboard.
+  readonly property string iconDir: Qt.resolvedUrl("icons").toString().replace(/^file:\/\//, "")
   readonly property string home: Quickshell.env("HOME")
 
   // Set by the bar widget from its settings.
@@ -130,7 +133,7 @@ Item {
   }
 
   function notify(summary, body, icon) {
-    Quickshell.execDetached(["notify-send", "-a", "Proton Drive", "-i", icon || "folder-cloud", summary, body || ""])
+    Quickshell.execDetached(["notify-send", "-a", "Proton Drive", "-i", root.iconDir + "/" + (icon || "upload") + ".svg", summary, body || ""])
   }
 
   function showFlash(text) {
@@ -268,11 +271,11 @@ Item {
             var body = r.items + " item" + (r.items === 1 ? "" : "s") + ", " + root.size(r.bytes)
               + (r.skipped ? " (" + r.skipped + " already there)" : "")
             root.notify(verb + " " + job.label, job.kind === "download" ? body + "\nto " + job.dest : body,
-              job.kind === "upload" ? "folder-cloud" : "folder-download")
+              job.kind)
           } else {
             var why = r.error || (r.failures || []).join("\n") || "unknown error"
             root.lastError = (job.kind === "upload" ? "Upload" : "Download") + " of " + job.label + " failed: " + why
-            root.notify((job.kind === "upload" ? "Upload" : "Download") + " failed", job.label + "\n" + why, "dialog-error")
+            root.notify((job.kind === "upload" ? "Upload" : "Download") + " failed", job.label + "\n" + why, "error")
           }
           if (job.kind === "upload" && (job.target === root.path)) root.open(root.path)
         }
